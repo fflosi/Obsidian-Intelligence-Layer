@@ -14,7 +14,12 @@ export class VaultWatcher {
   private watcher: FSWatcher | null = null;
   private vaultPath: string;
   private graph: GraphIndex;
-  private cache: SessionCache;
+  /**
+   * Session caches to invalidate on file change. In stdio mode this holds a
+   * single cache; in HTTP mode each connected MCP session registers its own
+   * cache so the one shared watcher fans invalidations to all of them.
+   */
+  private caches = new Set<SessionCache>();
 
   /** Debounce timer for batching rapid changes */
   private pendingUpdates = new Map<string, NodeJS.Timeout>();
@@ -23,11 +28,21 @@ export class VaultWatcher {
   constructor(
     vaultPath: string,
     graph: GraphIndex,
-    cache: SessionCache,
+    cache?: SessionCache,
   ) {
     this.vaultPath = vaultPath;
     this.graph = graph;
-    this.cache = cache;
+    if (cache) this.caches.add(cache);
+  }
+
+  /** Register a session cache to receive file-change invalidations. */
+  registerCache(cache: SessionCache): void {
+    this.caches.add(cache);
+  }
+
+  /** Stop invalidating a session cache (call when its MCP session closes). */
+  unregisterCache(cache: SessionCache): void {
+    this.caches.delete(cache);
   }
 
   /**
@@ -113,8 +128,10 @@ export class VaultWatcher {
     notePath: string,
     event: "add" | "change" | "unlink",
   ): Promise<void> {
-    // Invalidate session cache first (always safe)
-    this.cache.invalidateNote(notePath);
+    // Invalidate session caches first (always safe)
+    for (const cache of this.caches) {
+      cache.invalidateNote(notePath);
+    }
 
     if (event === "unlink") {
       this.graph.removeNote(notePath);

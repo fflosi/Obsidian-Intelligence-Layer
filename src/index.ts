@@ -15,6 +15,7 @@ import { registerRetrieveTools } from "./tools/retrieve.js";
 import { registerWriteTools } from "./tools/write.js";
 import { registerDomainTools } from "./tools/domain.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
+import { startHttpServer, type SessionServer } from "./http-server.js";
 
 async function main(): Promise<void> {
   // ── Resolve vault path ─────────────────────────────────────────────────
@@ -70,43 +71,73 @@ async function main(): Promise<void> {
   }
 
   // ── 3. Initialise session cache ────────────────────────────────────────
-  const cache = new SessionCache();
+  // (In HTTP mode each MCP session gets its own cache; the watcher is created
+  //  without an initial cache and per-session caches register themselves.)
 
-  // ── 4. Start file watcher ──────────────────────────────────────────────
-  const watcher = new VaultWatcher(vaultPath, graph, cache);
+  // ── 4. Start file watcher (shared across all sessions) ─────────────────
+  const watcher = new VaultWatcher(vaultPath, graph);
   watcher.start();
   console.error("[OIL] File watcher started.");
 
-  // ── 5. Create MCP server and register tools ────────────────────────────
-  const server = new McpServer({
-    name: SERVER_NAME,
-    version: SERVER_VERSION,
-  });
+  // ── 5. Per-session MCP server factory ──────────────────────────────────
+  // The expensive state above (config, graph, watcher) is built once and
+  // shared. Each MCP session gets a lightweight McpServer + its own
+  // SessionCache so the write-gate pendingWrites queue stays isolated.
+  const createSessionServer = (): SessionServer => {
+    const cache = new SessionCache();
+    watcher.registerCache(cache);
 
-  // Core visibility tool
-  registerCoreTools(server, vaultPath, graph, cache, watcher, config);
+    const server = new McpServer({
+      name: SERVER_NAME,
+      version: SERVER_VERSION,
+    });
 
-  // Optimized retrieve/search tools
-  registerRetrieveTools(server, vaultPath, graph, cache, config);
+    // Core visibility tool
+    registerCoreTools(server, vaultPath, graph, cache, watcher, config);
+    // Optimized retrieve/search tools
+    registerRetrieveTools(server, vaultPath, graph, cache, config);
+    // Atomic write tools with mtime concurrency checks
+    registerWriteTools(server, vaultPath, graph, cache, config);
+    // High-value domain tools (deterministic assembly, CRM prefetch, health)
+    registerDomainTools(server, vaultPath, graph, cache, config);
 
-  // Atomic write tools with mtime concurrency checks
-  registerWriteTools(server, vaultPath, graph, cache, config);
-
-  // High-value domain tools (deterministic assembly, CRM prefetch, health)
-  registerDomainTools(server, vaultPath, graph, cache, config);
+    return {
+      server,
+      dispose: () => watcher.unregisterCache(cache),
+    };
+  };
 
   console.error("[OIL] Tools registered.");
 
   // ── 6. Connect transport ───────────────────────────────────────────────
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("[OIL] MCP server ready.");
+  // OIL_HTTP_PORT switches to a shared Streamable HTTP server (one process
+  // serves every session). Unset -> classic per-process stdio (default).
+  const httpPortRaw = process.env.OIL_HTTP_PORT;
+  const httpPort = httpPortRaw ? Number.parseInt(httpPortRaw, 10) : undefined;
+
+  if (httpPort !== undefined && !Number.isNaN(httpPort)) {
+    const httpPath = process.env.OIL_HTTP_PATH ?? "/mcp";
+    const httpHost = process.env.OIL_HTTP_HOST ?? "127.0.0.1";
+    await startHttpServer({
+      port: httpPort,
+      path: httpPath,
+      host: httpHost,
+      createSessionServer,
+    });
+    console.error(
+      `[OIL] MCP server ready (HTTP) — http://${httpHost}:${httpPort}${httpPath}`,
+    );
+  } else {
+    const { server } = createSessionServer();
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("[OIL] MCP server ready (stdio).");
+  }
 
   // ── Graceful shutdown ──────────────────────────────────────────────────
   const shutdown = async () => {
     console.error("[OIL] Shutting down...");
     await watcher.stop();
-    await server.close();
     process.exit(0);
   };
 
