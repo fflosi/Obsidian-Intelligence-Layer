@@ -67,7 +67,32 @@ npm run build
 OBSIDIAN_VAULT_PATH=/path/to/your/vault node dist/index.js
 ```
 
-The server communicates over **stdio**. You don't hit it with curl — an MCP client connects to it.
+The server communicates over **stdio** by default; an MCP client connects to it.
+This fork also supports opt-in shared HTTP via `OIL_HTTP_PORT`.
+
+### Client disconnect and process cleanup
+
+In stdio mode, closing the client's input pipe (`stdin` end/close), an input/output
+pipe error, or MCP transport closure triggers shutdown. OIL closes the MCP server,
+unregisters its session cache, stops the persistent vault watcher and cancels its
+pending debounce timers. It also waits for tracked background graph persistence.
+`SIGINT` and `SIGTERM` use the same idempotent cleanup path, registered before
+vault initialization. Startup input is not consumed until the MCP transport is
+connected, so an early initialize request is preserved.
+
+Normal cleanup exits with code 0. Pipe errors or cleanup failure exit with code 1;
+a five-second backstop forces exit with code 1 if cleanup stalls. A forced exit
+can interrupt unfinished work, so it is a fallback, not the normal shutdown path.
+Diagnostics go to stderr, leaving stdout for MCP messages.
+
+This fixes the case where the client closes its pipes but OIL's persistent
+watcher otherwise keeps Node alive. It does not impose an idle timeout or reduce
+the number of live stdio sessions. If another process retains the client's input
+pipe open, EOF will not arrive; this change is not a general process-tree reaper.
+Already-orphaned processes running an older build are not affected.
+
+HTTP mode deliberately ignores stdin closure: a shared service must survive an
+individual client's disconnect. No switch to HTTP is required for this fix.
 
 ### Connect to VS Code (Copilot / Claude)
 
@@ -393,6 +418,19 @@ npm run bench:watch  # Benchmarks in watch mode
 ```
 
 ### Build Requirements
+
+The lifecycle regression tests spawn the compiled server against disposable
+vaults (never the user's vault). Build first:
+
+```bash
+npm run build
+npx vitest run src/__tests__/stdio-lifecycle.test.ts
+```
+
+Coverage includes ordinary EOF, startup input preservation, early EOF, multiple
+clients, a force-killed client (with a `cmd.exe` launcher on Windows), cleanup
+failure/timeout, and HTTP remaining available after stdin closes. The tests
+terminate only their own fixture processes.
 
 - Node.js ≥ 20
 - TypeScript 5.7+

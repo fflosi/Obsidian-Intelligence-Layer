@@ -74,15 +74,14 @@ export class VaultWatcher {
    * Stop watching.
    */
   async stop(): Promise<void> {
-    if (this.watcher) {
-      await this.watcher.close();
-      this.watcher = null;
-    }
+    const watcher = this.watcher;
+    this.watcher = null;
     // Clear any pending debounced updates
     for (const timer of this.pendingUpdates.values()) {
       clearTimeout(timer);
     }
     this.pendingUpdates.clear();
+    await watcher?.close();
   }
 
   getStatus(): {
@@ -104,6 +103,7 @@ export class VaultWatcher {
     fullPath: string,
     event: "add" | "change" | "unlink",
   ): void {
+    if (!this.watcher) return;
     if (!isAllowedFile(fullPath)) return;
 
     const notePath = relative(this.vaultPath, fullPath);
