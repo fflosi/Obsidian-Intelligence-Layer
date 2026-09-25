@@ -6,7 +6,7 @@ import { FSWatcher } from "chokidar";
 import { VaultWatcher } from "../watcher.js";
 import { GraphIndex } from "../graph.js";
 import { SessionCache } from "../cache.js";
-import { mkdtemp, rm, mkdir, writeFile, unlink } from "node:fs/promises";
+import { mkdtemp, realpath, rm, mkdir, writeFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -14,7 +14,10 @@ let tempDir: string;
 let vaultRoot: string;
 
 beforeAll(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), "oil-watcher-"));
+  // libuv on Windows can assert when a watcher is opened through an 8.3 short
+  // temp path but events arrive with the long path. Canonicalize the root so
+  // the watched directory and event filenames use the same representation.
+  tempDir = await mkdtemp(join(await realpath(tmpdir()), "oil-watcher-"));
   vaultRoot = join(tempDir, "vault");
   await mkdir(join(vaultRoot, "notes"), { recursive: true });
 

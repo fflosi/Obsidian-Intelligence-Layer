@@ -72,14 +72,20 @@ export class VaultWatcher {
     this.openWatcher(this.indexMayBeStale);
   }
 
-  private ignorePath(fullPath: string, stats?: Stats): boolean {
+  private shouldIgnore(fullPath: string): boolean {
     const rel = normalizeNotePath(relative(this.vaultPath, fullPath));
     if (rel === "") return false;
     if (rel.startsWith("../")) return true;
-    const parts = rel.split("/");
+    return rel
+      .split("/")
+      .some((part) => part.startsWith(".") || part.toLowerCase() === "node_modules");
+  }
+
+  private ignorePath(fullPath: string, stats?: Stats): boolean {
+    if (this.shouldIgnore(fullPath)) return true;
+    const parts = normalizeNotePath(relative(this.vaultPath, fullPath)).split("/");
     // Exclude lock artifacts even on Chokidar's first call, before stat/watch.
-    if (parts.some((part) => part.startsWith(".") ||
-      part.toLowerCase() === "node_modules" || /\.lock$/i.test(part))) return true;
+    if (parts.some((part) => /\.lock$/i.test(part))) return true;
     // Directories must remain traversable; filter other files by the vault contract.
     return stats?.isFile() === true && !isAllowedFile(fullPath);
   }
