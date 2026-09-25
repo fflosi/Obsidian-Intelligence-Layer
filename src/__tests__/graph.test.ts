@@ -10,6 +10,26 @@ import { tmpdir } from "node:os";
 let tempDir: string;
 let vaultRoot: string;
 
+it("strict recovery builds expose failures and always release the building flag", async () => {
+  const root = await mkdtemp(join(tmpdir(), "oil-strict-"));
+  try {
+    await writeFile(join(root, "bad.md"), "---\nbroken: [\n---\n# Bad note");
+    const graph = new GraphIndex(root);
+    // Normal startup retains the existing skip-malformed-note behavior.
+    await expect(graph.build()).resolves.toBeUndefined();
+    await expect(graph.build({ strict: true })).rejects.toThrow();
+    expect(graph.building).toBe(false);
+    await writeFile(join(root, "bad.md"), "# Repaired");
+    await expect(graph.build({ strict: true })).resolves.toBeUndefined();
+    expect(graph.getNode("bad.md")?.title).toBe("Repaired");
+    const missing = new GraphIndex(join(root, "missing"));
+    await expect(missing.build({ strict: true })).rejects.toThrow();
+    expect(missing.building).toBe(false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 beforeAll(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "oil-graph-"));
   vaultRoot = join(tempDir, "vault");

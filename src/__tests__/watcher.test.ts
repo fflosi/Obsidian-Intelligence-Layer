@@ -1,7 +1,8 @@
 /**
  * Tests for watcher.ts — VaultWatcher: start/stop, debounced file change handling.
  */
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
+import { FSWatcher } from "chokidar";
 import { VaultWatcher } from "../watcher.js";
 import { GraphIndex } from "../graph.js";
 import { SessionCache } from "../cache.js";
@@ -57,6 +58,7 @@ describe("VaultWatcher — file change detection", () => {
 
   afterEach(async () => {
     if (watcher) await watcher.stop();
+    vi.restoreAllMocks();
   });
 
   it("detects new file and updates graph", { retry: 2 }, async () => {
@@ -177,5 +179,38 @@ describe("VaultWatcher — file change detection", () => {
     // Clean up
     await unlink(join(vaultRoot, "notes/data.json"));
     await new Promise((r) => setTimeout(r, 600));
+  });
+
+  it("does not watch lock artifacts and catches up changes missed during recovery", async () => {
+    graph = new GraphIndex(vaultRoot);
+    await graph.build();
+    cache = new SessionCache();
+    const lockPath = join(vaultRoot, "notes/operation.lock");
+    const missedPath = join(vaultRoot, "notes/missed.md");
+    await writeFile(lockPath, "fixture lock - not a note");
+    const add = vi.spyOn(FSWatcher.prototype, "add");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    watcher = new VaultWatcher(vaultRoot, graph, cache);
+    watcher.start();
+    try {
+      await expect.poll(() => watcher.getStatus().state, { timeout: 10000 }).toBe("healthy");
+      const fsWatcher: FSWatcher = add.mock.results[0].value;
+      const watchedNames = Object.values(fsWatcher.getWatched()).flat();
+      expect(watchedNames).not.toContain("operation.lock");
+      expect(watchedNames).toContain("existing.md");
+      fsWatcher.emit("error", Object.assign(new Error("fixture locked file"), { code: "EBUSY" }));
+      expect(watcher.getStatus().indexMayBeStale).toBe(true);
+      await writeFile(missedPath, "# Missed during restart\n");
+      await expect.poll(() => watcher.getStatus().state, { timeout: 15000 }).toBe("healthy");
+      expect(graph.getNode("notes/missed.md")).toBeDefined();
+      expect(watcher.getStatus().indexMayBeStale).toBe(false);
+      await writeFile(missedPath, "# Updated after restart\n");
+      await expect.poll(() => graph.getNode("notes/missed.md")?.title, { timeout: 10000 })
+        .toBe("Updated after restart");
+    } finally {
+      await watcher.stop();
+      await rm(lockPath, { force: true });
+      await rm(missedPath, { force: true });
+    }
   });
 });

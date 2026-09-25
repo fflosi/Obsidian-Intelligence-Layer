@@ -310,3 +310,40 @@ it("keeps the HTTP service alive when stdin closes", async () => {
   expect(response.status).toBe(200);
   expect(await response.text()).toBe("ok");
 }, 90000);
+
+it("keeps stdio usable after a watcher error and still exits on client EOF", async () => {
+  const vault = await createVault();
+  const fixture = join(vault, "watcher-error.mjs");
+  const chokidarUrl = pathToFileURL(resolve("node_modules/chokidar/esm/index.js")).href;
+  await writeFile(fixture, `
+    import { FSWatcher } from ${JSON.stringify(chokidarUrl)};
+    const add = FSWatcher.prototype.add;
+    let injected = false;
+    FSWatcher.prototype.add = function (...args) {
+      if (!injected) {
+        injected = true;
+        this.once("ready", () => {
+          this.emit("error", Object.assign(new Error("fixture busy lock"), { code: "EBUSY" }));
+          console.error("fixture-error-injected");
+        });
+      }
+      return add.apply(this, args);
+    };
+    await import(${JSON.stringify(entryUrl)});
+  `);
+  const { child, stdout } = launch(fixture, vault);
+  await waitForReady(child, "fixture-error-injected");
+  child.stdin.write(JSON.stringify({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2024-11-05", capabilities: {},
+      clientInfo: { name: "watcher-error-test", version: "1" } },
+  }) + "\n");
+  await expect.poll(() => stdout(), { timeout: 8000 }).toContain('"id":1');
+  child.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
+  child.stdin.write('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_health","arguments":{}}}\n');
+  await expect.poll(() => stdout(), { timeout: 8000 }).toContain('"id":2');
+  expect(child.exitCode).toBeNull();
+  const exited = waitForExit(child);
+  child.stdin.end();
+  expect(await exited).toBe(0);
+}, 90000);

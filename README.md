@@ -94,6 +94,55 @@ Already-orphaned processes running an older build are not affected.
 HTTP mode deliberately ignores stdin closure: a shared service must survive an
 individual client's disconnect. No switch to HTTP is required for this fix.
 
+### Watcher errors and stale indexes
+
+The watcher excludes dot-directories, `node_modules`, and `.lock` artifacts
+before opening filesystem watches. Other regular files are watched only if they
+match the vault's supported `.md`, `.markdown`, or `.txt` extensions. Directories
+remain traversable; the automation's lock files are never deleted or modified.
+Filtering uses a predicate, not glob strings (Chokidar v4 does not support globs).
+
+Watcher errors are logged to stderr and do not terminate the MCP transport.
+For `EBUSY`, `EPERM`, `EACCES`, `ENOENT`, `EMFILE`, `ENFILE`, and `ENOSPC`,
+OIL closes the failed watcher before retrying, with at most three restarts per
+watcher lifetime (delays: 1, 2, 4 seconds). Reaching `ready` does not reset this
+budget, preventing an endless restart loop. Unknown errors, exhausted retries,
+or failed cleanup leave the watcher degraded. Shutdown cancels retries and
+ignores late events.
+
+A slow initial scan is not an error. After 30 seconds OIL logs a warning and
+sets `readinessDelayed` and `indexMayBeStale`, but leaves the same watcher running
+in `starting` (or `recovering`) state. When `ready` eventually arrives, OIL performs
+catch-up before declaring the index fresh. It also waits for any ongoing startup
+graph build rather than aborting it after an arbitrary deadline. This prevents
+large or OneDrive-backed vaults from losing their watcher just because enumeration
+takes longer than 30 seconds. If readiness never arrives, health remains visibly
+pending; no periodic restart loop is created.
+
+After a restart reaches `ready`, a strict catch-up rebuild reconciles changes
+missed during the gap. Note/traversal/search caches are invalidated without
+discarding pending write confirmations. A failed rebuild does not report a
+fresh index; ordinary startup retains its existing lenient parsing behavior.
+Watcher events use forward-slash vault-relative paths on Windows, matching the
+graph and cache keys.
+
+`get_health` includes:
+
+- `watcher.state`: `stopped`, `starting`, `healthy`, `recovering`, or `degraded`.
+- `watcher.active`: true only when watching is healthy.
+- `watcher.indexMayBeStale`: true after a failure until catch-up succeeds.
+- `watcher.readinessDelayed`: initial scanning has exceeded 30 seconds and is
+  still pending (cleared on `ready` or stop).
+- `watcher.restartAttempts`: retries used in this watcher lifetime.
+- `watcher.lastError`: the most recent error's code, message, and timestamp
+  (retained as history even after recovery).
+
+The MCP connection stays usable while degraded, but graph-backed answers can be
+stale or partial; inspect health before relying on them. Resolve the filesystem
+problem and restart OIL if retries are exhausted. An old chat whose OIL process
+already crashed will still need a fresh connection; editing source cannot
+repair an existing dead transport.
+
 ### Connect to VS Code (Copilot / Claude)
 
 **Option A: Per-workspace** — add to `.vscode/mcp.json` in any workspace:
@@ -429,8 +478,16 @@ npx vitest run src/__tests__/stdio-lifecycle.test.ts
 
 Coverage includes ordinary EOF, startup input preservation, early EOF, multiple
 clients, a force-killed client (with a `cmd.exe` launcher on Windows), cleanup
-failure/timeout, and HTTP remaining available after stdin closes. The tests
+failure/timeout, watcher-error survival followed by EOF shutdown, and HTTP
+remaining available after stdin closes. The tests
 terminate only their own fixture processes.
+
+Source-level watcher/health tests do not require rebuilding `dist`:
+
+```bash
+npx vitest run src/__tests__/watcher.test.ts src/__tests__/watcher-recovery.test.ts src/__tests__/graph.test.ts src/__tests__/tools-core.test.ts
+npm run lint
+```
 
 - Node.js ≥ 20
 - TypeScript 5.7+

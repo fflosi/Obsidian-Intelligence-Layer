@@ -70,7 +70,7 @@ export class GraphIndex {
   /**
    * Build the complete graph index by parsing all markdown files.
    */
-  async build(): Promise<void> {
+  async build(options: { strict?: boolean } = {}): Promise<void> {
     this._building = true;
     this.nodes.clear();
     this.tagIndex.clear();
@@ -78,34 +78,37 @@ export class GraphIndex {
     this.rawOutLinks.clear();
     this.fileMtimes.clear();
 
-    const notePaths = await listAllNotes(this.vaultPath);
-
-    // Phase 1: Parse all notes, collect outlinks and metadata
-    for (const notePath of notePaths) {
-      await this.indexNote(notePath);
+    try {
+      const notePaths = await listAllNotes(this.vaultPath);
+      // Phase 1: Parse all notes, collect outlinks and metadata
+      for (const notePath of notePaths) {
+        await this.indexNote(notePath, options.strict);
+      }
+      // Phase 2: Resolve wikilinks → paths and compute backlinks
+      this.resolveLinks();
+      this._lastIndexed = new Date();
+    } finally {
+      this._building = false;
     }
-
-    // Phase 2: Resolve wikilinks → paths and compute backlinks
-    this.resolveLinks();
-
-    this._lastIndexed = new Date();
-    this._building = false;
   }
 
   /**
    * Parse a single note and add it to the index.
    */
-  private async indexNote(notePath: string): Promise<void> {
+  private async indexNote(notePath: string, strict = false): Promise<void> {
     try {
       const fullPath = join(this.vaultPath, notePath);
       const raw = await readFile(fullPath, "utf-8");
-      const { data: frontmatter, content } = matter(raw);
+      // gray-matter caches before parsing, including failed parses. A recovery
+      // rebuild must re-parse rather than accept a cached partial result.
+      const { data: frontmatter, content } = matter(raw, strict ? {} : undefined);
 
       // Track mtime for incremental rebuild
       try {
         const fileStat = await stat(fullPath);
         this.fileMtimes.set(notePath, fileStat.mtimeMs);
-      } catch {
+      } catch (error) {
+        if (strict) throw error;
         // Use current time if stat fails
         this.fileMtimes.set(notePath, Date.now());
       }
@@ -147,7 +150,9 @@ export class GraphIndex {
         }
         paths.add(notePath);
       }
-    } catch {
+    } catch (error) {
+      // Recovery must not declare a partial rebuild fresh after a read failure.
+      if (strict) throw error;
       // Skip files that can't be parsed
     }
   }
