@@ -7,7 +7,7 @@ import { FSWatcher } from "chokidar";
 import type { Stats } from "node:fs";
 import { relative } from "node:path";
 import { isAllowedFile } from "./vault.js";
-import type { GraphIndex } from "./graph.js";
+import { normalizeNotePath, type GraphIndex } from "./graph.js";
 import type { SessionCache } from "./cache.js";
 import { invalidateSearchIndex } from "./search.js";
 
@@ -73,7 +73,10 @@ export class VaultWatcher {
   }
 
   private ignorePath(fullPath: string, stats?: Stats): boolean {
-    const parts = relative(this.vaultPath, fullPath).split(/[/\\]/);
+    const rel = normalizeNotePath(relative(this.vaultPath, fullPath));
+    if (rel === "") return false;
+    if (rel.startsWith("../")) return true;
+    const parts = rel.split("/");
     // Exclude lock artifacts even on Chokidar's first call, before stat/watch.
     if (parts.some((part) => part.startsWith(".") ||
       part.toLowerCase() === "node_modules" || /\.lock$/i.test(part))) return true;
@@ -259,7 +262,9 @@ export class VaultWatcher {
     if (!this.watcher) return;
     if (!isAllowedFile(fullPath)) return;
 
-    const notePath = relative(this.vaultPath, fullPath).replace(/\\/g, "/");
+    // `relative()` yields backslashes on Windows; the graph and session cache
+    // are both keyed on POSIX-style vault paths, so normalize before dispatch.
+    const notePath = normalizeNotePath(relative(this.vaultPath, fullPath));
 
     // Cancel any pending update for this path
     const existing = this.pendingUpdates.get(notePath);

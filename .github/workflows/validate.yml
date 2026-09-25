@@ -1,0 +1,33 @@
+# Validate the fork without publishing under the upstream package scope.
+name: Validate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'scripts/package-smoke.mjs'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/validate.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Check release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+      - run: npm run check:release
+      - run: npm run bench

@@ -61,7 +61,6 @@ async function main(): Promise<void> {
   // ── 2. Build graph index (with persistence + background indexing) ─────
   const graph = new GraphIndex(vaultPath);
   const graphFile = config.search.graphIndexFile;
-  const bgThreshold = config.search.backgroundIndexThresholdMs;
 
   const loaded = await graph.loadFromDisk(graphFile);
   if (lifecycle.isShuttingDown()) return;
@@ -88,10 +87,13 @@ async function main(): Promise<void> {
     console.error(
       `[OIL] Graph index built in ${elapsed}ms — ${stats.noteCount} notes, ${stats.linkCount} links, ${stats.tagCount} tags.`,
     );
-    // Save to disk for next startup
+    // Track persistence for lifecycle cleanup and await it before serving: an
+    // early shutdown would otherwise force another full rebuild next startup.
     backgroundWork = graph.saveToDisk(graphFile).catch((err) =>
       console.error("[OIL] Failed to save graph index:", err),
     );
+    await backgroundWork;
+    if (lifecycle.isShuttingDown()) return;
   }
 
   // ── 3. Initialise session cache ────────────────────────────────────────

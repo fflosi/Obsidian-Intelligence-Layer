@@ -5,11 +5,12 @@
  * Persisted to _oil-graph.json for fast restart.
  */
 
-import { readFile, writeFile, stat } from "node:fs/promises";
-import { join, basename, extname } from "node:path";
+import { readFile, writeFile, rename, unlink, readdir, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { join, dirname, basename, extname } from "node:path";
 import matter from "gray-matter";
 import type { GraphNode, GraphStats, NoteRef, TagCount } from "./types.js";
-import { listAllNotes, extractWikilinks, isAllowedFile } from "./vault.js";
+import { listAllNotes, extractWikilinks, isAllowedFile, normalizeLineEndings } from "./vault.js";
 
 // ─── Persisted Graph Format ───────────────────────────────────────────────────
 
@@ -31,6 +32,15 @@ interface PersistedGraph {
 }
 
 // ─── Graph Index ──────────────────────────────────────────────────────────────
+
+/**
+ * Vault note paths are canonically POSIX-style (Obsidian convention), but
+ * `path.relative()` on Windows returns backslashes. Normalizing at every
+ * index boundary keeps watcher-driven updates matching the indexed keys.
+ */
+export function normalizeNotePath(notePath: string): string {
+  return notePath.replace(/\\/g, "/");
+}
 
 export class GraphIndex {
   /** path → GraphNode */
@@ -101,7 +111,12 @@ export class GraphIndex {
       const raw = await readFile(fullPath, "utf-8");
       // gray-matter caches before parsing, including failed parses. A recovery
       // rebuild must re-parse rather than accept a cached partial result.
-      const { data: frontmatter, content } = matter(raw, strict ? {} : undefined);
+      // Normalize CRLF up front — heading/tag regexes below use `.` and `$`,
+      // neither of which tolerates a trailing "\r".
+      const { data: frontmatter, content } = matter(
+        normalizeLineEndings(raw),
+        strict ? {} : undefined,
+      );
 
       // Track mtime for incremental rebuild
       try {
@@ -199,10 +214,11 @@ export class GraphIndex {
    * Re-index a single note after it changes on disk.
    */
   async updateNote(notePath: string): Promise<void> {
+    const key = normalizeNotePath(notePath);
     // Remove old data
-    this.removeNote(notePath);
+    this.removeNote(key);
     // Re-index
-    await this.indexNote(notePath);
+    await this.indexNote(key);
     // Full link re-resolution (could be optimised for single-note updates)
     this.resolveAllBacklinks();
   }
@@ -211,9 +227,13 @@ export class GraphIndex {
    * Remove a note from the index.
    */
   removeNote(notePath: string): void {
-    const node = this.nodes.get(notePath);
+    const key = normalizeNotePath(notePath);
+    const node = this.nodes.get(key);
     if (!node) return;
+    return this.removeNodeInternal(key, node);
+  }
 
+  private removeNodeInternal(notePath: string, node: GraphNode): void {
     // Remove from tag index
     for (const tag of node.tags) {
       this.tagIndex.get(tag)?.delete(notePath);
@@ -281,9 +301,55 @@ export class GraphIndex {
       nodes: persistedNodes,
     };
 
+    // Write-then-rename: a plain writeFile truncates the file first, so a
+    // second OIL instance reading concurrently sees partial JSON and discards
+    // the index, forcing a full rebuild. Rename is atomic for readers.
     const fullPath = join(this.vaultPath, graphIndexFile);
-    await writeFile(fullPath, JSON.stringify(data), "utf-8");
+    const tmpPath = `${fullPath}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(tmpPath, JSON.stringify(data), "utf-8");
+      // Windows fails the rename with EPERM while another instance has the
+      // index open for reading; that clears in milliseconds.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await rename(tmpPath, fullPath);
+          break;
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if ((code !== "EPERM" && code !== "EACCES") || attempt >= 4) throw err;
+          await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
+        }
+      }
+    } catch (err) {
+      await unlink(tmpPath).catch(() => {});
+      throw err;
+    }
+    await this.sweepStaleTemps(fullPath);
     console.error(`[OIL] Graph index saved: ${persistedNodes.length} nodes.`);
+  }
+
+  /**
+   * Remove temp files orphaned when a process was killed between write and
+   * rename. Only sweeps files old enough to not belong to a live save.
+   */
+  private async sweepStaleTemps(indexFullPath: string): Promise<void> {
+    try {
+      const dir = dirname(indexFullPath);
+      const prefix = `${basename(indexFullPath)}.`;
+      const cutoff = Date.now() - 60_000;
+      const entries = await readdir(dir);
+      await Promise.all(
+        entries
+          .filter((name) => name.startsWith(prefix) && name.endsWith(".tmp"))
+          .map(async (name) => {
+            const candidate = join(dir, name);
+            const info = await stat(candidate).catch(() => null);
+            if (info && info.mtimeMs < cutoff) await unlink(candidate).catch(() => {});
+          }),
+      );
+    } catch {
+      // Best-effort cleanup only.
+    }
   }
 
   /**
@@ -352,71 +418,91 @@ export class GraphIndex {
 
       this._lastIndexed = new Date(data.builtAt);
       console.error(`[OIL] Graph index loaded from disk: ${this.nodes.size} nodes.`);
+      // Startup is the reliable moment to clear temp files from a killed save;
+      // a read-only session may never write.
+      await this.sweepStaleTemps(fullPath);
       return true;
-    } catch {
+    } catch (err) {
+      // A missing index is the normal first-run case; anything else is a
+      // silent downgrade to a full rebuild and worth naming.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") {
+        console.error(
+          `[OIL] Graph index unreadable (${code ?? (err as Error).message}) — falling back to full build.`,
+        );
+      }
       return false;
     }
   }
 
   /**
-   * Incremental rebuild: load from disk, then re-index only notes whose
-   * mtime has changed, plus any new notes. Removes deleted notes.
+   * Incremental rebuild: re-index only notes whose mtime has changed, plus any
+   * new notes. Removes deleted notes. Loads from disk only when the index is
+   * not already in memory.
    * Returns the number of notes that were re-indexed.
    */
   async buildIncremental(graphIndexFile: string): Promise<number> {
     this._building = true;
 
-    const loaded = await this.loadFromDisk(graphIndexFile);
-    if (!loaded) {
-      // No persisted index — do a full build
-      await this.build();
-      await this.saveToDisk(graphIndexFile);
-      return this.nodes.size;
-    }
-
-    const vaultNotes = new Set(await listAllNotes(this.vaultPath));
-    let reindexed = 0;
-
-    // Remove notes that no longer exist in the vault
-    for (const path of [...this.nodes.keys()]) {
-      if (!vaultNotes.has(path)) {
-        this.removeNote(path);
-        reindexed++;
-      }
-    }
-
-    // Check each vault note against persisted mtime
-    for (const notePath of vaultNotes) {
-      const fullPath = join(this.vaultPath, notePath);
-      let currentMtime: number;
-      try {
-        const fileStat = await stat(fullPath);
-        currentMtime = fileStat.mtimeMs;
-      } catch {
-        continue; // file disappeared
+    try {
+      // Startup loads the index before calling this. Re-reading it would parse
+      // the whole file a second time and discard any note the watcher or a
+      // write tool has already updated in memory.
+      if (this.nodes.size === 0) {
+        const loaded = await this.loadFromDisk(graphIndexFile);
+        if (!loaded) {
+          // No persisted index — do a full build
+          await this.build();
+          await this.saveToDisk(graphIndexFile);
+          return this.nodes.size;
+        }
       }
 
-      const cachedMtime = this.fileMtimes.get(notePath);
-      if (cachedMtime === undefined || Math.abs(currentMtime - cachedMtime) > 1) {
-        // Note is new or changed — re-index it
-        this.removeNote(notePath);
-        await this.indexNote(notePath);
-        reindexed++;
+      const vaultNotes = new Set(await listAllNotes(this.vaultPath));
+      let reindexed = 0;
+
+      // Remove notes that no longer exist in the vault
+      for (const path of [...this.nodes.keys()]) {
+        if (!vaultNotes.has(path)) {
+          this.removeNote(path);
+          reindexed++;
+        }
       }
-    }
 
-    if (reindexed > 0) {
-      // Re-resolve all links since graph topology may have changed
-      this.resolveAllBacklinks();
-      this._lastIndexed = new Date();
-      await this.saveToDisk(graphIndexFile);
-      console.error(`[OIL] Incremental rebuild: ${reindexed} note(s) updated.`);
-    } else {
-      console.error("[OIL] Graph index up to date — no changes detected.");
-    }
+      // Check each vault note against persisted mtime
+      for (const notePath of vaultNotes) {
+        const fullPath = join(this.vaultPath, notePath);
+        let currentMtime: number;
+        try {
+          const fileStat = await stat(fullPath);
+          currentMtime = fileStat.mtimeMs;
+        } catch {
+          continue; // file disappeared
+        }
 
-    this._building = false;
-    return reindexed;
+        const cachedMtime = this.fileMtimes.get(notePath);
+        if (cachedMtime === undefined || Math.abs(currentMtime - cachedMtime) > 1) {
+          // Note is new or changed — re-index it
+          this.removeNote(notePath);
+          await this.indexNote(notePath);
+          reindexed++;
+        }
+      }
+
+      if (reindexed > 0) {
+        // Re-resolve all links since graph topology may have changed
+        this.resolveAllBacklinks();
+        this._lastIndexed = new Date();
+        await this.saveToDisk(graphIndexFile);
+        console.error(`[OIL] Incremental rebuild: ${reindexed} note(s) updated.`);
+      } else {
+        console.error("[OIL] Graph index up to date — no changes detected.");
+      }
+
+      return reindexed;
+    } finally {
+      this._building = false;
+    }
   }
 
   // ─── Graph Queries ──────────────────────────────────────────────────────
@@ -425,7 +511,7 @@ export class GraphIndex {
    * Get all notes that link TO a given note (backlinks).
    */
   getBacklinks(notePath: string): NoteRef[] {
-    const node = this.nodes.get(notePath);
+    const node = this.nodes.get(normalizeNotePath(notePath));
     if (!node) return [];
     return [...node.inLinks]
       .map((p) => this.toNoteRef(p))
@@ -436,7 +522,7 @@ export class GraphIndex {
    * Get all notes linked FROM a given note (forward links).
    */
   getForwardLinks(notePath: string): NoteRef[] {
-    const node = this.nodes.get(notePath);
+    const node = this.nodes.get(normalizeNotePath(notePath));
     if (!node) return [];
     return [...node.outLinks]
       .map((p) => this.toNoteRef(p))
@@ -536,7 +622,7 @@ export class GraphIndex {
    * Get the GraphNode for a path (or undefined).
    */
   getNode(notePath: string): GraphNode | undefined {
-    return this.nodes.get(notePath);
+    return this.nodes.get(normalizeNotePath(notePath));
   }
 
   /**

@@ -145,7 +145,33 @@ repair an existing dead transport.
 
 ### Connect to VS Code (Copilot / Claude)
 
-**Option A: Per-workspace** — add to `.vscode/mcp.json` in any workspace:
+**Option A: Run from GitHub** — add to `.vscode/mcp.json` in any workspace:
+
+```json
+{
+  "servers": {
+    "oil": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "--package=github:JinLee794/Obsidian-Intelligence-Layer#v0.5.5",
+        "--",
+        "obsidian-intelligence-layer",
+        "mcp"
+      ],
+      "envFile": "${workspaceFolder}/.env"
+    }
+  }
+}
+```
+
+The `.env` file must define `OBSIDIAN_VAULT_PATH` with an absolute path. The
+release tag keeps installs reproducible, but this option runs the stable upstream
+release and does not include this fork's HTTP transport or lifecycle extensions.
+Use a local checkout when those extensions are required.
+
+**Option B: Run a local checkout** — build the project first, then use:
 
 ```json
 {
@@ -163,7 +189,7 @@ repair an existing dead transport.
 }
 ```
 
-**Option B: Global (all workspaces)** — add to `~/.copilot/mcp-config.json` so OIL is available across all Copilot CLI sessions and workspaces:
+**Option C: Global local checkout** — add to `~/.copilot/mcp-config.json` so OIL is available across all Copilot CLI sessions and workspaces:
 
 ```json
 {
