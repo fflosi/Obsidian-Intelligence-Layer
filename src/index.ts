@@ -15,28 +15,52 @@ import { registerRetrieveTools } from "./tools/retrieve.js";
 import { registerWriteTools } from "./tools/write.js";
 import { registerDomainTools } from "./tools/domain.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
-import { startHttpServer, type SessionServer } from "./http-server.js";
+import { startHttpServer, type SessionServer, type HttpServerHandle } from "./http-server.js";
 import { installShutdownHandlers } from "./shutdown.js";
+import { resolveStartupConfig, STARTUP_HELP } from "./startup-config.js";
+import { HttpRuntime } from "./http-runtime.js";
 
 async function main(): Promise<void> {
-  // ── Resolve vault path ─────────────────────────────────────────────────
-  const vaultPath = process.env.OBSIDIAN_VAULT_PATH;
-  if (!vaultPath) {
-    console.error(
-      "Error: OBSIDIAN_VAULT_PATH environment variable is required.\n" +
-        "Set it to the absolute path of your Obsidian vault.",
-    );
-    process.exit(1);
+  if (process.argv.includes("--help")) {
+    console.log(STARTUP_HELP);
+    return;
   }
-
-  const httpPortRaw = process.env.OIL_HTTP_PORT;
-  const httpPort = httpPortRaw ? Number.parseInt(httpPortRaw, 10) : undefined;
-  const useHttp = httpPort !== undefined && !Number.isNaN(httpPort);
+  const options = await resolveStartupConfig(process.argv.slice(2));
+  const { vaultPath } = options;
+  if (options.http) {
+    let runtime: HttpRuntime | undefined;
+    let host: HttpServerHandle | undefined;
+    let startingHost: Promise<HttpServerHandle> | undefined;
+    const lifecycle = installShutdownHandlers({
+      stdio: false,
+      cleanup: async () => {
+        runtime?.beginStop();
+        if (startingHost) host = await startingHost;
+        const results = await Promise.allSettled([host?.close(), runtime?.stop()]);
+        for (const result of results) if (result.status === "rejected") throw result.reason;
+      },
+    });
+    const config = await loadConfig(vaultPath, true);
+    if (lifecycle.isShuttingDown()) return;
+    runtime = new HttpRuntime(vaultPath, config);
+    const shared = runtime;
+    startingHost = startHttpServer({
+      ...options.http,
+      readiness: () => shared.status(),
+      createSessionServer: () => shared.createSession(),
+      drain: () => shared.tools.drain(),
+    });
+    host = await startingHost;
+    if (lifecycle.isShuttingDown()) return;
+    console.error(`[OIL] MCP server ready (HTTP) - ${host.url}; vault initializing, check /readyz.`);
+    await shared.initialize();
+    return;
+  }
   let watcher: VaultWatcher | undefined;
   let stdioSession: SessionServer | undefined;
   let backgroundWork: Promise<void> = Promise.resolve();
   const lifecycle = installShutdownHandlers({
-    stdio: !useHttp,
+    stdio: true,
     cleanup: async () => {
       const results = await Promise.allSettled([
         watcher?.stop(),
@@ -136,30 +160,13 @@ async function main(): Promise<void> {
 
   console.error("[OIL] Tools registered.");
 
-  // ── 6. Connect transport ───────────────────────────────────────────────
-  // OIL_HTTP_PORT switches to a shared Streamable HTTP server (one process
-  // serves every session). Unset -> classic per-process stdio (default).
-  if (httpPort !== undefined && !Number.isNaN(httpPort)) {
-    const httpPath = process.env.OIL_HTTP_PATH ?? "/mcp";
-    const httpHost = process.env.OIL_HTTP_HOST ?? "127.0.0.1";
-    await startHttpServer({
-      port: httpPort,
-      path: httpPath,
-      host: httpHost,
-      createSessionServer,
-    });
-    console.error(
-      `[OIL] MCP server ready (HTTP) — http://${httpHost}:${httpPort}${httpPath}`,
-    );
-  } else {
-    stdioSession = createSessionServer();
-    const { server } = stdioSession;
-    server.server.onclose = () => lifecycle.shutdown("MCP transport closed");
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    if (lifecycle.isShuttingDown()) return;
-    console.error("[OIL] MCP server ready (stdio).");
-  }
+  stdioSession = createSessionServer();
+  const { server } = stdioSession;
+  server.server.onclose = () => lifecycle.shutdown("MCP transport closed");
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  if (lifecycle.isShuttingDown()) return;
+  console.error("[OIL] MCP server ready (stdio).");
 }
 
 main().catch((err) => {

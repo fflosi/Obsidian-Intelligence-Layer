@@ -13,6 +13,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { STARTUP_HELP } from "./startup-config.js";
 
 // ── Load .env from cwd (simple key=value, no dotenv dependency) ────
 const envFile = resolve(process.cwd(), ".env");
@@ -34,13 +35,11 @@ if (existsSync(envFile)) {
 // ── Route subcommand ───────────────────────────────────────────────
 const command = process.argv[2];
 
-if (command === "mcp") {
+if (process.argv.includes("--help")) {
+  console.log(STARTUP_HELP);
+} else if (command === "mcp") {
   await import("./index.js");
 } else {
-  console.error(
-    "Usage: obsidian-intelligence-layer mcp\n\n" +
-      "Starts the OIL MCP server over stdio.\n" +
-      "Requires OBSIDIAN_VAULT_PATH to be set.",
-  );
+  console.error(STARTUP_HELP);
   process.exit(1);
 }

@@ -131,13 +131,14 @@ function remapYaml(raw: Record<string, unknown>): Record<string, unknown> {
  * Load OIL configuration from `oil.config.yaml` in the vault root.
  * Falls back to defaults if the file doesn't exist.
  */
-export async function loadConfig(vaultPath: string): Promise<OilConfig> {
+export async function loadConfig(vaultPath: string, strict = false): Promise<OilConfig> {
   const configPath = join(vaultPath, "oil.config.yaml");
 
   try {
     const raw = await readFile(configPath, "utf-8");
     const parsed = parseYaml(raw) as Record<string, unknown> | null;
-    if (!parsed || typeof parsed !== "object") {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      if (strict && parsed !== null) throw new Error("oil.config.yaml must contain a mapping.");
       return { ...DEFAULTS };
     }
     const remapped = remapYaml(parsed);
@@ -145,7 +146,8 @@ export async function loadConfig(vaultPath: string): Promise<OilConfig> {
       DEFAULTS as unknown as Record<string, unknown>,
       remapped,
     ) as unknown as OilConfig;
-  } catch {
+  } catch (error) {
+    if (strict && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     // Config file doesn't exist — use defaults
     return { ...DEFAULTS };
   }

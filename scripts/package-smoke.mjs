@@ -115,6 +115,7 @@ try {
     env: {
       ...process.env,
       OBSIDIAN_VAULT_PATH: smokeVault,
+      OIL_TRANSPORT: "stdio",
     },
     stderr: "pipe",
   });

@@ -441,7 +441,7 @@ export class GraphIndex {
    * not already in memory.
    * Returns the number of notes that were re-indexed.
    */
-  async buildIncremental(graphIndexFile: string): Promise<number> {
+  async buildIncremental(graphIndexFile: string, options: { strict?: boolean } = {}): Promise<number> {
     this._building = true;
 
     try {
@@ -452,7 +452,8 @@ export class GraphIndex {
         const loaded = await this.loadFromDisk(graphIndexFile);
         if (!loaded) {
           // No persisted index — do a full build
-          await this.build();
+          await this.build(options);
+          this._building = true;
           await this.saveToDisk(graphIndexFile);
           return this.nodes.size;
         }
@@ -476,7 +477,8 @@ export class GraphIndex {
         try {
           const fileStat = await stat(fullPath);
           currentMtime = fileStat.mtimeMs;
-        } catch {
+        } catch (error) {
+          if (options.strict) throw error;
           continue; // file disappeared
         }
 
@@ -484,7 +486,7 @@ export class GraphIndex {
         if (cachedMtime === undefined || Math.abs(currentMtime - cachedMtime) > 1) {
           // Note is new or changed — re-index it
           this.removeNote(notePath);
-          await this.indexNote(notePath);
+          await this.indexNote(notePath, options.strict);
           reindexed++;
         }
       }

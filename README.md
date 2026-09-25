@@ -32,7 +32,10 @@ Without a smart interface, the agent does the dumb thing:
 
 ## What This Is (and Isn't)
 
-**OIL is not a REST API wrapper around Obsidian.** It's an MCP server — it speaks the [Model Context Protocol](https://modelcontextprotocol.io/) over stdio. AI agents connect to it as a tool provider; you don't hit it with curl.
+**OIL is not a REST API wrapper around Obsidian.** It's an MCP server that speaks the
+[Model Context Protocol](https://modelcontextprotocol.io/) over stdio or opt-in
+shared Streamable HTTP. The HTTP endpoint still uses MCP initialization, sessions,
+and tool calls; it is not a set of REST endpoints for notes.
 
 | Without OIL | With OIL |
 |---|---|
@@ -68,7 +71,107 @@ OBSIDIAN_VAULT_PATH=/path/to/your/vault node dist/index.js
 ```
 
 The server communicates over **stdio** by default; an MCP client connects to it.
-This fork also supports opt-in shared HTTP via `OIL_HTTP_PORT`.
+This fork also supports opt-in shared HTTP with a required client token.
+
+### Shared HTTP host (Windows service foundations)
+
+The host runs one Node process with one graph and watcher per vault, regardless
+of client count. Each client receives its own MCP server and session cache.
+Stdio remains the default and retains its client-disconnect cleanup behavior.
+
+**Migration:** older HTTP configurations that set only `OIL_HTTP_PORT` now fail
+explicitly until `OIL_HTTP_TOKEN_FILE` is configured. There is no unauthenticated
+HTTP mode and no fallback to stdio for invalid HTTP settings.
+
+Example foreground command, using a disposable vault and a pre-provisioned token:
+
+```powershell
+node 'V:\GitHub\Obsidian-Intelligence-Layer\dist\cli.js' mcp --transport http --vault-path 'C:\OIL-Trial\vault' --http-port 8020 --http-token-file 'C:\OIL-Trial\secrets\http-token'
+```
+
+The token file must be outside the vault and contain a cryptographically random
+base64url token (at least 32 characters, at most 512; 32 random bytes encoded as
+base64url is recommended). Restrict its Windows ACL to the service account and
+administrators. Do not commit it, log it, put the token value in process
+arguments, or put it inside the vault where tools could retrieve it.
+Filesystem ACL provisioning is an operator/deployment responsibility in this
+phase; the application does not modify ACLs.
+
+All routes require `Authorization: Bearer <token>`, including health probes.
+Configure clients to send this header through their supported secret mechanism;
+do not embed real credentials in shared client configuration. This is a local
+shared-secret mechanism, not an OAuth authorization server or per-user
+permissions system. Whoever has the token can call the vault tools.
+
+| Startup argument | Environment fallback | Default |
+|---|---|---|
+| `--transport` | `OIL_TRANSPORT` | `stdio`, or `http` if `OIL_HTTP_PORT` is nonempty |
+| `--vault-path` | `OBSIDIAN_VAULT_PATH` | Required absolute directory |
+| `--http-host` | `OIL_HTTP_HOST` | `127.0.0.1` (the only permitted bind address) |
+| `--http-port` | `OIL_HTTP_PORT` | `8020` in explicit HTTP mode |
+| `--http-path` | `OIL_HTTP_PATH` | `/mcp` |
+| `--http-token-file` | `OIL_HTTP_TOKEN_FILE` | Required in HTTP mode |
+
+Explicit flags take precedence over environment variables. `--transport stdio`
+ignores inherited HTTP environment settings, but rejects HTTP flags on the same
+command line. Vault paths are canonicalized and checked for directory/read/write
+access. Unknown arguments, bad ports, missing credentials, and inaccessible
+vaults fail startup. HTTP mode also rejects malformed `oil.config.yaml` rather
+than silently applying defaults. Use `mcp --help` for the argument contract.
+
+The vault path and token are startup settings, not hot-reload settings.
+Changing either requires a controlled restart. Future service management will
+persist the vault argument and validate updates without reinstalling the service.
+Do not use the Services console's temporary start parameters as a substitute for
+the wrapper's persistent executable arguments.
+
+#### Readiness, limits, and shutdown
+
+HTTP MCP initialization and tool discovery do not wait for indexing. All 14 tool
+names and input schemas are retained. The persisted graph is reconciled in the
+background, with the watcher started before scanning to capture intervening edits.
+Watcher updates wait for graph builds rather than mutating an in-progress build.
+
+| Surface | Meaning |
+|---|---|
+| Authenticated `GET /healthz` | Listener responds; returns liveness, readiness, and session count. HTTP 200 is **not** proof that vault tools are ready. |
+| Authenticated `GET /readyz` | HTTP 200 only when ready; otherwise HTTP 503 with initializing/degraded/failed/stopping state. |
+| MCP `get_health` | Remains available during indexing/degradation, with additive `readiness` data and existing graph/watcher/cache details. |
+| Other tools | Return an MCP `isError` result with `STALE_INDEX` while unready, rather than empty successful results. |
+
+Strict HTTP startup exposes unreadable/malformed notes as initialization failure.
+The listener remains available for diagnostics; fix the cause and restart.
+A lightweight access probe every five seconds detects a missing/inaccessible
+vault root and marks the runtime failed; it is not a full scan, synchronization
+check, or hang supervisor. Watcher-reported staleness also blocks vault tools.
+
+Current limits: 64 sessions, 30 minutes idle expiry, 1 MiB request bodies,
+10-second body timeout, 32 active HTTP requests, and 4 concurrent vault-tool
+executions across all sessions. Excess HTTP requests/sessions get HTTP 429;
+tool saturation returns `LIMIT_EXCEEDED`. Tool slots are held until actual
+execution finishes, even if the caller disconnects. There is no unbounded work
+queue. These limits are internal defaults, not currently CLI settings.
+
+Clients may terminate sessions with MCP HTTP DELETE. Lost/expired session IDs
+return HTTP 404; clients must initialize a new session without the old ID.
+Pending write confirmations are not transferred across sessions or restarts.
+The host uses JSON responses and returns HTTP 405 for standalone GET/SSE streams;
+tools requiring server-initiated notifications are not supported in this mode.
+Host/Origin checks only accept the listener's exact `127.0.0.1:port` authority
+(Origin may be omitted by non-browser clients). No wildcard CORS is enabled.
+
+Shutdown stops new work, drains tools, closes sessions and listener, and stops
+the watcher. HTTP close has a three-second deadline; process cleanup has a
+five-second forced-exit backstop. Unfinished writes can still be interrupted
+when a deadline is exceeded, so forced termination is not a clean-write guarantee.
+Closing a chat, its stdin, or its HTTP connection does not stop the shared host.
+
+**Not deployed yet:** no Windows service installer, WinSW binary/configuration,
+service-account credentials, client migration, or live-vault changes are part
+of these foundations. Wrapper-to-Node stop delivery, startup under the actual
+Windows account, Scout/Copilot reconnect behavior, and a workday soak remain
+deployment acceptance tests. Built-in SDK clients and disposable vaults are used
+for automated tests. Keep service runtime/logs/secrets outside the watched vault.
 
 ### Client disconnect and process cleanup
 
@@ -487,6 +590,10 @@ npm install          # Install dependencies
 npm run build        # Compile TypeScript → dist/
 npm run dev          # Watch mode (recompiles on change)
 npm run lint         # Type-check without emitting
+npm test             # Unit/lifecycle tests, then isolated performance gates
+npm run test:unit    # Unit tests (accepts Vitest file filters)
+npm run test:perf    # Performance gates without competing test files
+npm run test:package # Package, install in a temporary project, test stdio MCP
 npm start            # Run the server (needs OBSIDIAN_VAULT_PATH)
 npm run bench        # Run benchmark suite (vitest)
 npm run bench:watch  # Benchmarks in watch mode
@@ -507,6 +614,15 @@ clients, a force-killed client (with a `cmd.exe` launcher on Windows), cleanup
 failure/timeout, watcher-error survival followed by EOF shutdown, and HTTP
 remaining available after stdin closes. The tests
 terminate only their own fixture processes.
+
+The HTTP suites cover authenticated clients, session isolation/expiry, resource
+limits, readiness during blocked indexing, startup edits, stale writes, vault
+failure, and graceful shutdown. Run the complete release gate after building:
+
+```powershell
+npm run build
+npm run check:release
+```
 
 Source-level watcher/health tests do not require rebuilding `dist`:
 

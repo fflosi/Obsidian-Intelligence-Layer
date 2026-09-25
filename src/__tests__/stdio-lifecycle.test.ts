@@ -1,8 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, expect, it } from "vitest";
 
@@ -12,6 +12,7 @@ const vaults: string[] = [];
 const entryUrl = pathToFileURL(resolve("dist/index.js")).href;
 const shutdownUrl = pathToFileURL(resolve("dist/shutdown.js")).href;
 const sleep = (ms: number) => new Promise<void>((resolveSleep) => setTimeout(resolveSleep, ms));
+const httpToken = "lifecycle-test-token-".repeat(3);
 
 function waitForExit(child: ChildProcessWithoutNullStreams, timeout = 8000) {
   return new Promise<number | null>((resolveExit, reject) => {
@@ -48,15 +49,19 @@ async function waitUntilGone(pid: number) {
 }
 
 async function createVault() {
-  const vault = await mkdtemp(join(tmpdir(), "oil-lifecycle-"));
-  vaults.push(vault);
+  const root = await mkdtemp(join(await realpath(tmpdir()), "oil-lifecycle-"));
+  vaults.push(root);
+  const vault = join(root, "vault");
+  await mkdir(vault);
+  await writeFile(join(root, "token"), httpToken);
   await writeFile(join(vault, "test.md"), "# Lifecycle fixture\n");
   return vault;
 }
 
-function launch(file: string, vault: string, httpPort = "") {
-  const child = spawn(process.execPath, [file], {
+function launch(file: string, vault: string, httpPort = "", args: string[] = []) {
+  const child = spawn(process.execPath, [file, ...args], {
     env: { ...process.env, OBSIDIAN_VAULT_PATH: vault, OIL_HTTP_PORT: httpPort,
+      OIL_TRANSPORT: httpPort ? "http" : "stdio", OIL_HTTP_TOKEN_FILE: join(dirname(vault), "token"),
       OIL_HTTP_HOST: "127.0.0.1", OIL_HTTP_PATH: "/mcp" },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
@@ -299,16 +304,45 @@ it("keeps the HTTP service alive when stdin closes", async () => {
   if (!address || typeof address === "string") throw new Error("No test port");
   await new Promise<void>((done, reject) => socket.close((error) => error ? reject(error) : done()));
   const vault = await createVault();
-  const { child } = launch(resolve("dist/index.js"), vault, String(address.port));
+  const { child } = launch(resolve("dist/cli.js"), vault, "", [
+    "mcp", "--transport", "http", "--vault-path", vault, "--http-port", String(address.port),
+  ]);
   await waitForReady(child, "MCP server ready (HTTP)");
   child.stdin.end();
   await sleep(300);
   expect(child.exitCode).toBeNull();
   const response = await fetch(`http://127.0.0.1:${address.port}/healthz`, {
+    headers: { Authorization: `Bearer ${httpToken}` },
     signal: AbortSignal.timeout(5000),
   });
   expect(response.status).toBe(200);
-  expect(await response.text()).toBe("ok");
+  expect(await response.json()).toMatchObject({ live: true });
+}, 90000);
+
+it("gracefully stops the HTTP host and releases the port on a shutdown signal", async () => {
+  const socket = createServer();
+  await new Promise<void>((ready) => socket.listen(0, "127.0.0.1", ready));
+  const address = socket.address();
+  if (!address || typeof address === "string") throw new Error("No test port");
+  await new Promise<void>((done, reject) => socket.close((error) => error ? reject(error) : done()));
+  const vault = await createVault();
+  const fixture = join(vault, "http-signal.mjs");
+  await writeFile(fixture, `
+    process.stdin.on("data", () => process.emit("SIGTERM"));
+    await import(${JSON.stringify(entryUrl)});
+  `);
+  const { child } = launch(fixture, vault, String(address.port));
+  await waitForReady(child, "MCP server ready (HTTP)");
+  const endpoint = `http://127.0.0.1:${address.port}/healthz`;
+  await expect.poll(async () => {
+    const response = await fetch(endpoint, { headers: { Authorization: `Bearer ${httpToken}` } });
+    const body = await response.json();
+    return body.readiness.ready;
+  }, { timeout: 10_000 }).toBe(true);
+  const exited = waitForExit(child);
+  child.stdin.write("shutdown");
+  expect(await exited).toBe(0);
+  await expect(fetch(endpoint)).rejects.toThrow();
 }, 90000);
 
 it("keeps stdio usable after a watcher error and still exits on client EOF", async () => {

@@ -39,6 +39,7 @@ import {
 } from "../vault.js";
 import { extractPrefetchIds } from "../correlate.js";
 import { checkVaultHealth } from "../hygiene.js";
+import { runTool, type ToolAccess } from "../runtime-state.js";
 
 /**
  * Register the 3 high-value domain tools on the MCP server.
@@ -49,6 +50,7 @@ export function registerDomainTools(
   graph: GraphIndex,
   cache: SessionCache,
   config: OilConfig,
+  access?: ToolAccess,
 ): void {
   // ── get_customer_context ──────────────────────────────────────────────
 
@@ -81,7 +83,7 @@ export function registerDomainTools(
           .describe("Filter open items to a specific person"),
       },
     },
-    async ({ customer, lookback_days, include_similar, include_open_items, assignee, view }) => {
+    async ({ customer, lookback_days, include_similar, include_open_items, assignee, view }) => runTool(access, async () => {
       const requestedView = view ?? "full";
 
       // Auto-resolve TPID to customer name
@@ -248,7 +250,7 @@ export function registerDomainTools(
         ...envelope,
         ...result,
       });
-    },
+    }),
   );
 
   // ── prepare_crm_prefetch ──────────────────────────────────────────────
@@ -264,7 +266,7 @@ export function registerDomainTools(
           .describe("Customer names to extract IDs for"),
       },
     },
-    async ({ customers }) => {
+    async ({ customers }) => runTool(access, async () => {
       for (const c of customers) {
         const custErr = validateCustomerName(c);
         if (custErr) return validationError(`prepare_crm_prefetch: customer '${c}' — ${custErr}`);
@@ -315,7 +317,7 @@ export function registerDomainTools(
           "account_filter targets opportunity/milestone lookups by account GUID; " +
           "tpid_filter targets the accounts entity. Values are never truncated.",
       });
-    },
+    }),
   );
 
   // ── check_vault_health ────────────────────────────────────────────────
@@ -332,7 +334,7 @@ export function registerDomainTools(
           .describe("Filter to specific customers (default: all)"),
       },
     },
-    async ({ customers }) => {
+    async ({ customers }) => runTool(access, async () => {
       if (customers) {
         for (const c of customers) {
           const custErr = validateCustomerName(c);
@@ -379,7 +381,7 @@ export function registerDomainTools(
             ? `${issues.length} issue(s) found across ${report.totalCustomers} customers`
             : `All ${report.totalCustomers} customers healthy`,
       });
-    },
+    }),
   );
 }
 

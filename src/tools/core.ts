@@ -7,6 +7,7 @@ import type { VaultWatcher } from "../watcher.js";
 import type { OilConfig } from "../types.js";
 import { jsonResponse } from "../tool-responses.js";
 import { SERVER_NAME, SERVER_VERSION } from "../version.js";
+import type { RuntimeStatus } from "../runtime-state.js";
 
 const LIVE_TOOL_SURFACE = {
   core: 1,
@@ -22,6 +23,7 @@ export function registerCoreTools(
   cache: SessionCache,
   watcher: VaultWatcher,
   config: OilConfig,
+  runtimeStatus?: () => RuntimeStatus,
 ): void {
   server.registerTool(
     "get_health",
@@ -35,6 +37,7 @@ export function registerCoreTools(
       const graphStats = graph.getStats();
 
       return jsonResponse({
+        ...(runtimeStatus ? { readiness: runtimeStatus() } : {}),
         server: {
           name: SERVER_NAME,
           version: SERVER_VERSION,

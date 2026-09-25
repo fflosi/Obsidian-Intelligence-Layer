@@ -20,6 +20,7 @@ import { validateVaultPath, validationError } from "../validation.js";
 import { securePath, noteExists } from "../vault.js";
 import { appendToSection, executeWrite, logWrite } from "../gate.js";
 import { invalidateSearchIndex } from "../search.js";
+import { runTool, type ToolAccess } from "../runtime-state.js";
 
 /**
  * Register all Write tools on the MCP server.
@@ -30,6 +31,7 @@ export function registerWriteTools(
   graph: GraphIndex,
   cache: SessionCache,
   config: OilConfig,
+  access?: ToolAccess,
 ): void {
   /**
    * Bring every derived index back in sync with a note that was just written.
@@ -65,7 +67,7 @@ export function registerWriteTools(
           .describe("Expected file modification timestamp in milliseconds (use get_note_metadata.mtime_ms)"),
       },
     },
-    async ({ path, heading, content, expected_mtime }) => {
+    async ({ path, heading, content, expected_mtime }) => runTool(access, async () => {
       const pathErr = validateVaultPath(path);
       if (pathErr) {
         return validationError(
@@ -145,7 +147,7 @@ export function registerWriteTools(
           { path, ref: noteRef(path, heading) },
         );
       }
-    },
+    }),
   );
 
   // ── atomic_replace ────────────────────────────────────────────────────
@@ -163,7 +165,7 @@ export function registerWriteTools(
           .describe("Expected file modification timestamp in milliseconds (use get_note_metadata.mtime_ms)"),
       },
     },
-    async ({ path, content, expected_mtime }) => {
+    async ({ path, content, expected_mtime }) => runTool(access, async () => {
       const pathErr = validateVaultPath(path);
       if (pathErr) {
         return validationError(
@@ -242,7 +244,7 @@ export function registerWriteTools(
           { path, ref: noteRef(path) },
         );
       }
-    },
+    }),
   );
 
   // ── create_note ───────────────────────────────────────────────────────
@@ -257,7 +259,7 @@ export function registerWriteTools(
         content: z.string().describe("Full content for the new note"),
       },
     },
-    async ({ path, content }) => {
+    async ({ path, content }) => runTool(access, async () => {
       const pathErr = validateVaultPath(path);
       if (pathErr) {
         return validationError(
@@ -319,7 +321,7 @@ export function registerWriteTools(
           { path, ref: noteRef(path) },
         );
       }
-    },
+    }),
   );
 
   // ── get_agent_log ───────────────────────────────────────────────────
@@ -336,7 +338,7 @@ export function registerWriteTools(
           .describe("Date in YYYY-MM-DD format (default: today)"),
       },
     },
-    async ({ date }) => {
+    async ({ date }) => runTool(access, async () => {
       const dateStr = date ?? new Date().toISOString().slice(0, 10);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
         return validationError("get_agent_log: date must be YYYY-MM-DD format");
@@ -361,7 +363,7 @@ export function registerWriteTools(
           message: "No log entries for this date.",
         });
       }
-    },
+    }),
   );
 }
 

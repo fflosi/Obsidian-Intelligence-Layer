@@ -292,6 +292,12 @@ export class VaultWatcher {
     notePath: string,
     event: "add" | "change" | "unlink",
   ): Promise<void> {
+    const generation = this.generation;
+    while (this.graph.building) {
+      if (!this.running || generation !== this.generation) return;
+      await new Promise((done) => setTimeout(done, 100));
+    }
+    if (!this.running || generation !== this.generation) return;
     // Invalidate session caches first (always safe)
     for (const cache of this.caches) {
       cache.invalidateNote(notePath);

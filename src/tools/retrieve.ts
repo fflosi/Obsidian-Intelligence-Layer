@@ -20,6 +20,7 @@ import { validateVaultPath, validationError } from "../validation.js";
 import { readNote, securePath } from "../vault.js";
 import { fuzzySearch, searchVault } from "../search.js";
 import type { SearchResult } from "../types.js";
+import { runTool, type ToolAccess } from "../runtime-state.js";
 
 // ─── Frontmatter Index ────────────────────────────────────────────────────────
 
@@ -172,6 +173,7 @@ export function registerRetrieveTools(
   graph: GraphIndex,
   _cache: SessionCache,
   _config: OilConfig,
+  access?: ToolAccess,
 ): void {
   server.registerTool(
     "search_vault",
@@ -188,7 +190,7 @@ export function registerRetrieveTools(
         filter_tags: z.array(z.string()).optional().describe("Restrict to notes with these tags"),
       },
     },
-    async ({ query, tier, limit, filter_folder, filter_tags }) => {
+    async ({ query, tier, limit, filter_folder, filter_tags }) => runTool(access, async () => {
       if (!query || !query.trim()) {
         return validationError("search_vault: query must be a non-empty string");
       }
@@ -234,7 +236,7 @@ export function registerRetrieveTools(
           ref: noteRef(result.path),
         })),
       );
-    },
+    }),
   );
 
   // ── query_notes ───────────────────────────────────────────────────────
@@ -248,7 +250,7 @@ export function registerRetrieveTools(
         path: z.string().describe("Note path relative to vault root"),
       },
     },
-    async ({ path }) => {
+    async ({ path }) => runTool(access, async () => {
       const pathErr = validateVaultPath(path);
       if (pathErr) {
         return validationError(
@@ -287,7 +289,7 @@ export function registerRetrieveTools(
           { path, ref: noteRef(path) },
         );
       }
-    },
+    }),
   );
 
   // ── read_note_section ────────────────────────────────────────────────
@@ -302,7 +304,7 @@ export function registerRetrieveTools(
         heading: z.string().describe("Heading text to extract (without markdown # markers)"),
       },
     },
-    async ({ path, heading }) => {
+    async ({ path, heading }) => runTool(access, async () => {
       const pathErr = validateVaultPath(path);
       if (pathErr) {
         return validationError(
@@ -355,7 +357,7 @@ export function registerRetrieveTools(
           { path, ref: noteRef(path, heading) },
         );
       }
-    },
+    }),
   );
 
   // ── query_frontmatter ────────────────────────────────────────────────
@@ -370,7 +372,7 @@ export function registerRetrieveTools(
         value_fragment: z.string().describe("Case-insensitive value fragment to match"),
       },
     },
-    async ({ key, value_fragment }) => {
+    async ({ key, value_fragment }) => runTool(access, async () => {
       const fmIndex = buildFrontmatterIndex(graph);
       const entries = fmIndex.get(key.toLowerCase()) ?? [];
       const fragment = value_fragment.toLowerCase();
@@ -388,7 +390,7 @@ export function registerRetrieveTools(
         paths,
         matches: paths.map((path) => ({ path, ref: noteRef(path) })),
       });
-    },
+    }),
   );
 
   // ── get_related_entities ──────────────────────────────────────────────
@@ -403,7 +405,7 @@ export function registerRetrieveTools(
         max_hops: z.number().optional().describe("Maximum link hops (default: 2)"),
       },
     },
-    async ({ path, max_hops }) => {
+    async ({ path, max_hops }) => runTool(access, async () => {
       const pathErr = validateVaultPath(path);
       if (pathErr) {
         return validationError(
@@ -425,7 +427,7 @@ export function registerRetrieveTools(
         max_hops: max_hops ?? 2,
         related,
       });
-    },
+    }),
   );
 
   // ── semantic_search ──────────────────────────────────────────────────
@@ -440,7 +442,7 @@ export function registerRetrieveTools(
         limit: z.number().optional().describe("Max results (default: 10)"),
       },
     },
-    async ({ query, limit }) => {
+    async ({ query, limit }) => runTool(access, async () => {
       if (!query || !query.trim()) {
         return validationError("semantic_search: query must be a non-empty string");
       }
@@ -473,6 +475,6 @@ export function registerRetrieveTools(
       });
 
       return jsonResponse({ count: results.length, results });
-    },
+    }),
   );
 }
